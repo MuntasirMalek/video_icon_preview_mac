@@ -1,10 +1,8 @@
 #!/bin/bash
 # vidicon-finder: Get current Finder folder and set video icons
-# Each press cycles through different timeline positions: 5% → 25% → 50% → 75% → 5%
-# Called by Karabiner keyboard shortcut
+# Each press cycles: 5% → 25% → 50% → 75% → 5%
 
 STATE_DIR="$HOME/.config/vidicon"
-STATE_FILE="$STATE_DIR/cycle_state"
 
 # Cycle positions
 POSITIONS=(5 25 50 75)
@@ -21,40 +19,29 @@ tell application "Finder"
 end tell
 ' 2>/dev/null)
 
-if [ -z "$FOLDER" ]; then
-    osascript -e 'display notification "No Finder window found" with title "VidIcon" sound name "Basso"'
-    exit 1
-fi
+[ -z "$FOLDER" ] && exit 1
 
-# Read and advance cycle state (per folder)
+# Read cycle state per folder
 mkdir -p "$STATE_DIR"
 FOLDER_HASH=$(echo -n "$FOLDER" | md5 | head -c 8)
 CYCLE_FILE="$STATE_DIR/cycle_$FOLDER_HASH"
-
-if [ -f "$CYCLE_FILE" ]; then
-    IDX=$(cat "$CYCLE_FILE")
-else
-    IDX=0
-fi
-
+IDX=0
+[ -f "$CYCLE_FILE" ] && IDX=$(cat "$CYCLE_FILE")
 SEEK=${POSITIONS[$IDX]}
-
-# Advance to next position for next press
 NEXT_IDX=$(( (IDX + 1) % ${#POSITIONS[@]} ))
 echo "$NEXT_IDX" > "$CYCLE_FILE"
+NEXT_SEEK=${POSITIONS[$NEXT_IDX]}
 
 # Count videos
-COUNT=$(find "$FOLDER" -maxdepth 1 \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.m4v" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" -o -iname "*.mpg" -o -iname "*.mpeg" -o -iname "*.3gp" -o -iname "*.vob" -o -iname "*.ts" -o -iname "*.mts" -o -iname "*.m2ts" -o -iname "*.ogv" -o -iname "*.rmvb" \) 2>/dev/null | wc -l | tr -d ' ')
+COUNT=$(find "$FOLDER" -maxdepth 1 \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.m4v" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" -o -iname "*.mpg" -o -iname "*.mpeg" -o -iname "*.3gp" -o -iname "*.vob" -o -iname "*.ts" -o -iname "*.mts" -o -iname "*.ogv" \) 2>/dev/null | wc -l | tr -d ' ')
+[ "$COUNT" -eq 0 ] && { osascript -e 'display notification "No videos found" with title "VidIcon"'; exit 0; }
 
-if [ "$COUNT" -eq 0 ]; then
-    osascript -e "display notification \"No video files found\" with title \"VidIcon\" sound name \"Basso\""
-    exit 0
-fi
-
-NEXT_SEEK=${POSITIONS[$NEXT_IDX]}
-osascript -e "display notification \"$COUNT videos at ${SEEK}% • next: ${NEXT_SEEK}%\" with title \"VidIcon ⏳\""
+osascript -e "display notification \"${SEEK}% → next: ${NEXT_SEEK}%\" with title \"VidIcon ⏳ $COUNT videos\""
 
 /usr/local/bin/vidicon icons "$FOLDER" --seek "$SEEK" 2>/dev/null
 
-osascript -e 'tell application "Finder" to activate'
-osascript -e "display notification \"Done! Frame at ${SEEK}% • press again for ${NEXT_SEEK}%\" with title \"VidIcon ✅\" sound name \"Glass\""
+# Force Finder to refresh icons by toggling the folder view
+killall Finder 2>/dev/null
+sleep 0.5
+
+osascript -e "display notification \"Done at ${SEEK}% • press again for ${NEXT_SEEK}%\" with title \"VidIcon ✅\" sound name \"Glass\""
