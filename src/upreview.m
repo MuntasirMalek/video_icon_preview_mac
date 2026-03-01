@@ -744,11 +744,11 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
    }
  }
 
- static void set_rich_finder_icon(const char *filePath, int iconSize) {
+ static void set_rich_finder_icon(const char *filePath, int iconSize, double seekPct) {
    IconVideoInfo info;
    get_icon_video_info(filePath, &info);
 
-   CGImageRef frame = extract_frame(filePath, iconSize, 0.10);
+   CGImageRef frame = extract_frame(filePath, iconSize, seekPct);
    if (!frame)
      return;
 
@@ -763,7 +763,7 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
    }
  }
 
- static void batch_set_icons(const char *folder, int recursive, int width) {
+ static void batch_set_icons(const char *folder, int recursive, int width, double seekPct) {
    DIR *dir = opendir(folder);
    if (!dir) {
      fprintf(stderr, "Error: Cannot open folder: %s\n", folder);
@@ -784,7 +784,7 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
        continue;
 
      if (S_ISDIR(st.st_mode) && recursive) {
-       batch_set_icons(fullPath, recursive, width);
+       batch_set_icons(fullPath, recursive, width, seekPct);
        continue;
      }
 
@@ -796,7 +796,7 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
      printf("🎨 %s ... ", entry->d_name);
      fflush(stdout);
 
-     set_rich_finder_icon(fullPath, width);
+     set_rich_finder_icon(fullPath, width, seekPct);
 
      // Verify icon was set
      struct stat iconSt;
@@ -1072,14 +1072,17 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
        }
        int recursive = 0;
        int width = 512;
+        double seekPct = 0.05;
        for (int i = 3; i < argc; i++) {
          if (strcmp(argv[i], "--recursive") == 0 || strcmp(argv[i], "-r") == 0)
            recursive = 1;
          else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc)
            width = atoi(argv[++i]);
+          else if (strcmp(argv[i], "--seek") == 0 && i + 1 < argc)
+            seekPct = atoi(argv[++i]) / 100.0;
        }
-       printf("🎨 Setting Finder icons for videos in: %s\n", argv[2]);
-       batch_set_icons(argv[2], recursive, width);
+        printf("\xf0\x9f\x8e\xa8 Setting icons (frame at %d%%):\n", (int)(seekPct * 100));
+       batch_set_icons(argv[2], recursive, width, seekPct);
        printf("\n💡 If icons don't appear immediately, try: killall Finder\n");
 
      } else if (strcmp(cmd, "ql") == 0 || strcmp(cmd, "quicklook") == 0) {
