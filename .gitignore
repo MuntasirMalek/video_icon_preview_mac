@@ -1,0 +1,13 @@
+# Build artifacts
+vidicon
+upreview
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
+Icon?
+
+# IDE
+.vscode/
+.idea/
