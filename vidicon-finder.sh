@@ -14,7 +14,7 @@ AS
 
 [ -z "$FOLDER" ] && exit 1
 
-# Simple global counter for cycling 5 → 25 → 50 → 75 → 5
+# Cycle: 5 → 25 → 50 → 75 → 5
 CF=~/.vidicon_pos
 [ ! -f "$CF" ] && echo "0" > "$CF"
 POS=$(cat "$CF")
@@ -23,14 +23,23 @@ S=${SEEKS[$((POS % 4 + 1))]}
 echo $(( (POS + 1) % 4 )) > "$CF"
 
 osascript -e "display notification \"Setting icons at ${S}%\" with title \"VidIcon\""
+
+# Set the icons
 /usr/local/bin/vidicon icons "$FOLDER" --seek "$S" 2>/dev/null
 
-# Refresh Finder window without killing it
+# Force Finder to see the new icons by touching each video file
+for f in "$FOLDER"*.{mp4,mkv,avi,mov,m4v,wmv,flv,webm,mpg,mpeg,3gp,vob,ts,mts,ogv}; do
+  [ -f "$f" ] && touch "$f" 2>/dev/null
+done
+
+# Navigate away and back to force icon reload
 osascript <<'AS2'
 tell application "Finder"
   if (count of Finder windows) > 0 then
-    set theTarget to target of front Finder window
-    set target of front Finder window to theTarget
+    set origTarget to target of front Finder window
+    set target of front Finder window to (path to home folder)
+    delay 0.3
+    set target of front Finder window to origTarget
   end if
 end tell
 AS2
