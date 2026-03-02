@@ -771,12 +771,8 @@ static void batch_set_icons(const char *folder, int recursive, int width,
     return;
   }
 
-  // Collect all video file paths
-  int fileCount = 0;
-  int fileCapacity = 256;
-  char **files = (char **)malloc(fileCapacity * sizeof(char *));
-
   struct dirent *entry;
+  int success = 0, total = 0;
   while ((entry = readdir(dir)) != NULL) {
     if (entry->d_name[0] == '.') continue;
     char fullPath[4096];
@@ -789,63 +785,28 @@ static void batch_set_icons(const char *folder, int recursive, int width,
     }
     if (!S_ISREG(st.st_mode)) continue;
     if (!is_video_extension(entry->d_name)) continue;
-    if (fileCount >= fileCapacity) {
-      fileCapacity *= 2;
-      files = (char **)realloc(files, fileCapacity * sizeof(char *));
+    total++;
+
+    @autoreleasepool {
+      IconVideoInfo info;
+      get_icon_video_info(fullPath, &info);
+      CGImageRef frame = extract_frame(fullPath, width, seekPct);
+      if (!frame) {
+        printf("  \xe2\x9d\x8c %s\n", entry->d_name);
+        continue;
+      }
+      NSImage *richIcon = create_rich_icon(frame, &info, width);
+      CGImageRelease(frame);
+      if (richIcon) {
+        NSString *path = [NSString stringWithUTF8String:fullPath];
+        [[NSWorkspace sharedWorkspace] setIcon:richIcon forFile:path options:0];
+        printf("  \xe2\x9c\x85 %s\n", entry->d_name);
+        success++;
+      }
     }
-    files[fileCount++] = strdup(fullPath);
   }
   closedir(dir);
-
-  if (fileCount == 0) { free(files); return; }
-
-  printf("\xf0\x9f\x9a\x80 Processing %d videos...\n", fileCount);
-  fflush(stdout);
-
-  // Phase 1: Extract frames + metadata in parallel
-  __block CGImageRef *frames = (CGImageRef *)calloc(fileCount, sizeof(CGImageRef));
-  __block IconVideoInfo *infos = (IconVideoInfo *)calloc(fileCount, sizeof(IconVideoInfo));
-
-  dispatch_apply(fileCount, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t idx) {
-    @autoreleasepool {
-      get_icon_video_info(files[idx], &infos[idx]);
-      frames[idx] = extract_frame(files[idx], width, seekPct);
-    }
-  });
-
-  // Phase 2: Create rich icons and set them (sequential - NSWorkspace is not thread-safe)
-  int success = 0;
-  for (int i = 0; i < fileCount; i++) {
-    const char *name = strrchr(files[i], '/');
-    name = name ? name + 1 : files[i];
-
-    if (!frames[i]) {
-      printf("  \xe2\x9d\x8c %s (no frame)\n", name);
-      continue;
-    }
-
-    NSImage *richIcon = create_rich_icon(frames[i], &infos[i], width);
-    CGImageRelease(frames[i]);
-
-    if (richIcon) {
-      @autoreleasepool {
-        NSString *path = [NSString stringWithUTF8String:files[i]];
-        [[NSWorkspace sharedWorkspace] setIcon:richIcon forFile:path options:0];
-      }
-      printf("  \xe2\x9c\x85 %s\n", name);
-      success++;
-    } else {
-      printf("  \xe2\x9d\x8c %s (icon failed)\n", name);
-    }
-  }
-
-  // Cleanup
-  for (int i = 0; i < fileCount; i++) free(files[i]);
-  free(files);
-  free(frames);
-  free(infos);
-
-  printf("\n\xf0\x9f\x93\x8a Done: %d/%d icons (frame at %d%%)\n", success, fileCount, (int)(seekPct * 100));
+  printf("\n\xf0\x9f\x93\x8a Done: %d/%d icons (frame at %d%%)\n", success, total, (int)(seekPct * 100));
 }
 
 // ---- Quick Look preview (remux to MOV + open qlmanage) ----
