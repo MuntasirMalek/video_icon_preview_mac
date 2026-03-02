@@ -65,6 +65,7 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
   }
 
   codecCtx = avcodec_alloc_context3(codec);
+  codecCtx->thread_count = 1; // thread-safe for parallel batch
   avcodec_parameters_to_context(codecCtx,
                                 fmtCtx->streams[videoStream]->codecpar);
   if (avcodec_open2(codecCtx, codec, NULL) < 0) {
