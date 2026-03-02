@@ -770,8 +770,13 @@ static void batch_set_icons(const char *folder, int recursive, int width,
     return;
   }
 
+  // Collect all video file paths first
+  char **files = NULL;
+  int fileCount = 0;
+  int fileCapacity = 64;
+  files = (char **)malloc(fileCapacity * sizeof(char *));
+
   struct dirent *entry;
-  int success = 0, failed = 0;
   while ((entry = readdir(dir)) != NULL) {
     if (entry->d_name[0] == '.')
       continue;
@@ -793,25 +798,48 @@ static void batch_set_icons(const char *folder, int recursive, int width,
     if (!is_video_extension(entry->d_name))
       continue;
 
-    printf("🎨 %s ... ", entry->d_name);
-    fflush(stdout);
+    if (fileCount >= fileCapacity) {
+      fileCapacity *= 2;
+      files = (char **)realloc(files, fileCapacity * sizeof(char *));
+    }
+    files[fileCount++] = strdup(fullPath);
+  }
+  closedir(dir);
 
-    set_rich_finder_icon(fullPath, width, seekPct);
-
-    // Verify icon was set
-    struct stat iconSt;
-    char iconPath[4096];
-    snprintf(iconPath, sizeof(iconPath), "%s/Icon\r", folder);
-    // Just count success
-    printf("✅\n");
-    success++;
+  if (fileCount == 0) {
+    free(files);
+    return;
   }
 
-  closedir(dir);
-  printf("\n📊 Done: %d icons set", success);
-  if (failed > 0)
-    printf(", %d failed", failed);
-  printf("\n");
+  printf("\xf0\x9f\x9a\x80 Processing %d videos in parallel...\n", fileCount);
+  fflush(stdout);
+
+  __block int32_t done = 0;
+  int total = fileCount;
+
+  // Use dispatch_apply for parallel iteration with automatic thread management
+  dispatch_queue_t queue = dispatch_queue_create("com.vidicon.batch", DISPATCH_QUEUE_CONCURRENT);
+  dispatch_semaphore_t sem = dispatch_semaphore_create(4); // max 4 concurrent
+
+  dispatch_apply(fileCount, queue, ^(size_t idx) {
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    @autoreleasepool {
+      set_rich_finder_icon(files[idx], width, seekPct);
+      int32_t d = OSAtomicIncrement32(&done);
+      const char *name = strrchr(files[idx], '/');
+      name = name ? name + 1 : files[idx];
+      printf("  \xe2\x9c\x85 [%d/%d] %s\n", d, total, name);
+      fflush(stdout);
+    }
+    dispatch_semaphore_signal(sem);
+  });
+
+  // Cleanup
+  for (int i = 0; i < fileCount; i++)
+    free(files[i]);
+  free(files);
+
+  printf("\n\xf0\x9f\x93\x8a Done: %d icons (frame at %d%%)\n", total, (int)(seekPct * 100));
 }
 
 // ---- Quick Look preview (remux to MOV + open qlmanage) ----
