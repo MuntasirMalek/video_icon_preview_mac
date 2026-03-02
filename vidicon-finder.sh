@@ -14,10 +14,10 @@ fi
 CF=~/.vidicon_pos
 [ ! -f "$CF" ] && echo "0" > "$CF"
 POS=$(cat "$CF")
-SEEKS=(5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95)
-S=${SEEKS[$((POS % 19 + 1))]}
-echo $(( (POS + 1) % 19 )) > "$CF"
-NEXT_S=${SEEKS[$(( (POS + 1) % 19 + 1 ))]}
+SEEKS=(50 60 70 80 90 10 20 30 40)
+S=${SEEKS[$((POS % 9 + 1))]}
+echo $(( (POS + 1) % 9 )) > "$CF"
+NEXT_S=${SEEKS[$(( (POS + 1) % 9 + 1 ))]}
 
 # Check if specific files are selected in Finder
 SELECTED=$(osascript <<'AS'
