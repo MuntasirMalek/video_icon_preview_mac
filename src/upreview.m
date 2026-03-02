@@ -32,10 +32,21 @@
 #include <time.h>
 #include <unistd.h>
 
+// ---- Video info struct ----
+
+typedef struct {
+  char codec[64];
+  int width;
+  int height;
+  double duration;
+  off_t fileSize;
+} IconVideoInfo;
+
 // ---- Frame extraction using FFmpeg ----
 
-static CGImageRef extract_frame(const char *filePath, int maxWidth,
-                                double seekPercent) {
+static CGImageRef extract_frame_internal(const char *filePath, int maxWidth,
+                                         double seekPercent,
+                                         IconVideoInfo *outInfo) {
   AVFormatContext *fmtCtx = NULL;
   const AVCodec *codec = NULL;
   AVCodecContext *codecCtx = NULL;
@@ -48,9 +59,23 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
 
   if (avformat_open_input(&fmtCtx, filePath, NULL, NULL) < 0)
     return NULL;
+
+  // Reduce probing for speed — we only need one frame
+  fmtCtx->probesize = 512 * 1024;        // 512KB instead of 5MB default
+  fmtCtx->max_analyze_duration = 500000; // 0.5s instead of 5s default
+
   if (avformat_find_stream_info(fmtCtx, NULL) < 0) {
     avformat_close_input(&fmtCtx);
     return NULL;
+  }
+
+  // Fill outInfo if requested (avoids a second file open)
+  if (outInfo) {
+    struct stat st;
+    if (stat(filePath, &st) == 0)
+      outInfo->fileSize = st.st_size;
+    if (fmtCtx->duration > 0)
+      outInfo->duration = (double)fmtCtx->duration / AV_TIME_BASE;
   }
 
   for (unsigned int i = 0; i < fmtCtx->nb_streams; i++) {
@@ -71,8 +96,19 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
     return NULL;
   }
 
+  // Fill codec info if requested
+  if (outInfo) {
+    AVCodecParameters *par = fmtCtx->streams[videoStream]->codecpar;
+    if (codec->name)
+      strncpy(outInfo->codec, codec->name, sizeof(outInfo->codec) - 1);
+    outInfo->width = par->width;
+    outInfo->height = par->height;
+  }
+
   codecCtx = avcodec_alloc_context3(codec);
-  codecCtx->thread_count = 1; // thread-safe for parallel batch
+  codecCtx->thread_count = 2;
+  codecCtx->skip_frame = AVDISCARD_NONREF;    // skip B-frames during seeking
+  codecCtx->skip_loop_filter = AVDISCARD_ALL; // skip deblocking filter
   avcodec_parameters_to_context(codecCtx,
                                 fmtCtx->streams[videoStream]->codecpar);
   if (avcodec_open2(codecCtx, codec, NULL) < 0) {
@@ -109,14 +145,29 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
         av_rescale_q(seekTarget, (AVRational){1, AV_TIME_BASE}, streamTB);
   }
 
+  // Two-phase decode: skip non-keyframes until close, then full decode
+  // Phase 1 threshold: switch to full decode 2 seconds before target
+  int64_t nearThreshold = 0;
+  if (targetPTS > 0) {
+    nearThreshold =
+        targetPTS -
+        av_rescale_q(2 * AV_TIME_BASE, (AVRational){1, AV_TIME_BASE}, streamTB);
+    if (nearThreshold < 0)
+      nearThreshold = 0;
+    // Start with keyframe-only decoding (ultra fast skip)
+    codecCtx->skip_frame = AVDISCARD_NONKEY;
+  }
+
   int gotFrame = 0;
   int reachedTarget = 0;
+  int fullDecode = (targetPTS <= 0); // full decode if no seeking
   int maxPackets = 2000;
 retry_seek:
   while (maxPackets-- > 0 && !reachedTarget) {
     int ret = av_read_frame(fmtCtx, pkt);
     if (ret < 0) {
       // End of stream — flush the decoder to get remaining frames
+      codecCtx->skip_frame = AVDISCARD_DEFAULT;
       avcodec_send_packet(codecCtx, NULL);
       while (avcodec_receive_frame(codecCtx, frame) == 0) {
         gotFrame = 1;
@@ -131,10 +182,17 @@ retry_seek:
         seekTarget = seekTarget / 2;
         targetPTS =
             av_rescale_q(seekTarget, (AVRational){1, AV_TIME_BASE}, streamTB);
+        nearThreshold =
+            targetPTS - av_rescale_q(2 * AV_TIME_BASE,
+                                     (AVRational){1, AV_TIME_BASE}, streamTB);
+        if (nearThreshold < 0)
+          nearThreshold = 0;
         if (seekTarget < AV_TIME_BASE) {
           seekTarget = 0;
           targetPTS = -1;
         }
+        codecCtx->skip_frame = AVDISCARD_NONKEY;
+        fullDecode = (targetPTS <= 0);
         av_seek_frame(fmtCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(codecCtx);
         maxPackets = 500;
@@ -145,6 +203,12 @@ retry_seek:
     if (pkt->stream_index != videoStream) {
       av_packet_unref(pkt);
       continue;
+    }
+
+    // Phase transition: when packet PTS is near target, switch to full decode
+    if (!fullDecode && pkt->pts >= nearThreshold) {
+      codecCtx->skip_frame = AVDISCARD_DEFAULT;
+      fullDecode = 1;
     }
 
     ret = avcodec_send_packet(codecCtx, pkt);
@@ -169,7 +233,7 @@ retry_seek:
   int srcW = frame->width, srcH = frame->height;
   int dstW, dstH;
   if (maxWidth <= 0)
-    maxWidth = 512;
+    maxWidth = 256;
   if (srcW > maxWidth) {
     dstW = maxWidth;
     dstH = (int)((double)srcH * maxWidth / srcW);
@@ -181,7 +245,7 @@ retry_seek:
   }
 
   swsCtx = sws_getContext(srcW, srcH, frame->format, dstW, dstH,
-                          AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
+                          AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
   if (!swsCtx)
     goto cleanup;
 
@@ -239,6 +303,12 @@ cleanup:
   if (fmtCtx)
     avformat_close_input(&fmtCtx);
   return image;
+}
+
+// Convenience wrapper for callers that don't need video info
+static CGImageRef extract_frame(const char *filePath, int maxWidth,
+                                double seekPercent) {
+  return extract_frame_internal(filePath, maxWidth, seekPercent, NULL);
 }
 
 // ---- Save CGImage as PNG ----
@@ -521,14 +591,6 @@ static void batch_thumbnails(const char *folder, int recursive, int width) {
 }
 
 // ---- Rich Finder Icon with metadata overlays ----
-
-typedef struct {
-  char codec[64];
-  int width;
-  int height;
-  double duration;
-  off_t fileSize;
-} IconVideoInfo;
 
 static int get_icon_video_info(const char *filePath, IconVideoInfo *info) {
   memset(info, 0, sizeof(IconVideoInfo));
@@ -877,7 +939,7 @@ static void batch_set_icons(const char *folder, int recursive, int width,
   clock_gettime(CLOCK_MONOTONIC, &startTime);
 
   // Limit concurrency to avoid memory pressure
-  int maxWorkers = 4;
+  int maxWorkers = 8;
   dispatch_semaphore_t sem = dispatch_semaphore_create(maxWorkers);
   dispatch_group_t group = dispatch_group_create();
   dispatch_queue_t queue =
@@ -894,10 +956,11 @@ static void batch_set_icons(const char *folder, int recursive, int width,
         const char *name = entries[i].name;
         int idx = i + 1;
 
-        // Thread-safe: FFmpeg uses per-call contexts
+        // Single FFmpeg open: extract frame AND metadata together
         IconVideoInfo info;
-        get_icon_video_info(fullPath, &info);
-        CGImageRef frame = extract_frame(fullPath, width, seekPct);
+        memset(&info, 0, sizeof(IconVideoInfo));
+        CGImageRef frame =
+            extract_frame_internal(fullPath, width, seekPct, &info);
         if (!frame) {
           printf("  [%d/%d] \xe2\x9d\x8c %s\n", idx, total, name);
           dispatch_semaphore_signal(sem);
