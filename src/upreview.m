@@ -20,10 +20,17 @@
 #include <libswscale/swscale.h>
 
 #include <dirent.h>
+#include <dispatch/dispatch.h>
+#include <fcntl.h>
+#include <mach/mach_time.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 // ---- Frame extraction using FFmpeg ----
 
@@ -74,10 +81,12 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
     return NULL;
   }
 
-  // Seek
+  // Seek — with retry at progressively earlier positions
   int64_t duration = fmtCtx->duration;
+  int64_t seekTarget = 0;
+  int seekRetries = 0;
   if (duration > 0 && seekPercent > 0) {
-    int64_t seekTarget = (int64_t)(duration * seekPercent);
+    seekTarget = (int64_t)(duration * seekPercent);
     if (seekTarget < AV_TIME_BASE)
       seekTarget = AV_TIME_BASE;
     if (seekTarget > duration - AV_TIME_BASE)
@@ -92,17 +101,44 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
   if (!frame || !rgbFrame || !pkt)
     goto cleanup;
 
+  // Convert seek target to stream timebase for precise frame matching
+  AVRational streamTB = fmtCtx->streams[videoStream]->time_base;
+  int64_t targetPTS = -1;
+  if (duration > 0 && seekPercent > 0) {
+    targetPTS =
+        av_rescale_q(seekTarget, (AVRational){1, AV_TIME_BASE}, streamTB);
+  }
+
   int gotFrame = 0;
-  int maxPackets = 500;
-  while (maxPackets-- > 0) {
+  int reachedTarget = 0;
+  int maxPackets = 2000;
+retry_seek:
+  while (maxPackets-- > 0 && !reachedTarget) {
     int ret = av_read_frame(fmtCtx, pkt);
     if (ret < 0) {
-      if (!gotFrame && duration > 0) {
-        av_seek_frame(fmtCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
+      // End of stream — flush the decoder to get remaining frames
+      avcodec_send_packet(codecCtx, NULL);
+      while (avcodec_receive_frame(codecCtx, frame) == 0) {
+        gotFrame = 1;
+        int64_t ts = frame->best_effort_timestamp;
+        if (targetPTS < 0 || ts >= targetPTS) {
+          reachedTarget = 1;
+          break;
+        }
+      }
+      if (!reachedTarget && !gotFrame && duration > 0 && seekRetries < 4) {
+        seekRetries++;
+        seekTarget = seekTarget / 2;
+        targetPTS =
+            av_rescale_q(seekTarget, (AVRational){1, AV_TIME_BASE}, streamTB);
+        if (seekTarget < AV_TIME_BASE) {
+          seekTarget = 0;
+          targetPTS = -1;
+        }
+        av_seek_frame(fmtCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(codecCtx);
-        maxPackets = 100;
-        duration = 0;
-        continue;
+        maxPackets = 500;
+        goto retry_seek;
       }
       break;
     }
@@ -116,10 +152,14 @@ static CGImageRef extract_frame(const char *filePath, int maxWidth,
     if (ret < 0)
       continue;
 
-    ret = avcodec_receive_frame(codecCtx, frame);
-    if (ret == 0) {
+    // Drain all frames from this packet
+    while (avcodec_receive_frame(codecCtx, frame) == 0) {
       gotFrame = 1;
-      break;
+      int64_t ts = frame->best_effort_timestamp;
+      if (targetPTS < 0 || ts >= targetPTS) {
+        reachedTarget = 1;
+        break;
+      }
     }
   }
 
@@ -297,15 +337,15 @@ static void open_preview_window(const char *filePath) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
-    // Try native AVPlayer first
     NSString *path = [NSString stringWithUTF8String:filePath];
     NSURL *fileURL = [NSURL fileURLWithPath:path];
-    AVPlayer *player = [AVPlayer playerWithURL:fileURL];
 
-    // Check if can play
-    AVPlayerItem *item = player.currentItem;
-    if (item && item.status != AVPlayerItemStatusFailed) {
-      // Create window with AVPlayerView
+    // Check if AVFoundation can handle this format by probing the asset
+    AVAsset *asset = [AVAsset assetWithURL:fileURL];
+    NSArray *videoTracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+    if (videoTracks.count > 0) {
+      // Native playback with AVPlayerView
+      AVPlayer *player = [AVPlayer playerWithURL:fileURL];
       NSRect frame = NSMakeRect(100, 100, 960, 540);
       NSWindow *window = [[NSWindow alloc]
           initWithContentRect:frame
@@ -375,42 +415,43 @@ static void open_preview_window(const char *filePath) {
 
 // ---- Batch thumbnail generation ----
 
-static int is_video_extension(const char *filename) {
+static int is_video_extension(const char *fullPath) {
+  const char *filename = strrchr(fullPath, '/');
+  filename = filename ? filename + 1 : fullPath;
   const char *ext = strrchr(filename, '.');
   if (!ext)
     return 0;
   ext++;
 
   // All known video container extensions
-  const char *videoExts[] = {// Common
-                             "mp4", "mkv", "avi", "mov", "m4v", "wmv", "flv",
-                             "webm",
-                             // MPEG
-                             "mpg", "mpeg", "mpe", "m2v", "mpv", "m1v",
-                             // Transport streams
-                             "ts", "mts", "m2ts", "mxf",
-                             // Mobile/legacy
-                             "3gp", "3g2", "3gpp", "3gpp2",
-                             // OGG/Theora
-                             "ogv", "ogg",
-                             // Real/DivX/Misc
-                             "rmvb", "rm", "divx", "f4v", "f4p",
-                             // DVD/Blu-ray
-                             "vob", "evo",
-                             // Others
-                             "asf", "swf", "amv", "dv", "drc", "gif", "mxf",
-                             "nut", "nsv", "yuv", "y4m",
-                             // AVCHD
-                             "mod", "tod",
-                             // Rare but valid
-                             "bik", "roq", "svi", "smk", NULL};
+  static const char *videoExts[] = {
+      // Common
+      "mp4", "mkv", "avi", "mov", "m4v", "wmv", "flv", "webm",
+      // MPEG
+      "mpg", "mpeg", "mpe", "m2v", "mpv", "m1v",
+      // Transport streams
+      "ts", "mts", "m2ts", "mxf",
+      // Mobile/legacy
+      "3gp", "3g2", "3gpp", "3gpp2",
+      // OGG/Theora
+      "ogv", "ogg",
+      // Real/DivX/Misc
+      "rmvb", "rm", "divx", "f4v", "f4p",
+      // DVD/Blu-ray
+      "vob", "evo",
+      // Others
+      "asf", "amv", "dv", "drc", "mxf", "nut", "nsv", "yuv", "y4m",
+      // AVCHD
+      "mod", "tod",
+      // Rare but valid
+      "bik", "roq", "svi", "smk", NULL};
 
   for (int i = 0; videoExts[i]; i++) {
     if (strcasecmp(ext, videoExts[i]) == 0) {
       // For .ts files, skip small files (likely TypeScript)
       if (strcasecmp(ext, "ts") == 0) {
         struct stat st;
-        if (stat(filename, &st) == 0 && st.st_size < 100000)
+        if (stat(fullPath, &st) == 0 && st.st_size < 100000)
           return 0;
       }
       return 1;
@@ -445,7 +486,7 @@ static void batch_thumbnails(const char *folder, int recursive, int width) {
 
     if (!S_ISREG(st.st_mode))
       continue;
-    if (!is_video_extension(entry->d_name))
+    if (!is_video_extension(fullPath))
       continue;
 
     // Generate thumbnail
@@ -763,6 +804,52 @@ static void set_rich_finder_icon(const char *filePath, int iconSize,
   }
 }
 
+// Collected file entry for parallel processing
+typedef struct {
+  char path[4096];
+  char name[256];
+} VideoFileEntry;
+
+static void collect_video_files(const char *folder, int recursive,
+                                VideoFileEntry **entries, int *count,
+                                int *capacity) {
+  DIR *dir = opendir(folder);
+  if (!dir)
+    return;
+
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_name[0] == '.')
+      continue;
+    char fullPath[4096];
+    snprintf(fullPath, sizeof(fullPath), "%s/%s", folder, entry->d_name);
+    struct stat st;
+    if (stat(fullPath, &st) != 0)
+      continue;
+    if (S_ISDIR(st.st_mode) && recursive) {
+      collect_video_files(fullPath, recursive, entries, count, capacity);
+      continue;
+    }
+    if (!S_ISREG(st.st_mode))
+      continue;
+    if (!is_video_extension(fullPath))
+      continue;
+
+    // Grow array if needed
+    if (*count >= *capacity) {
+      *capacity = (*capacity == 0) ? 64 : *capacity * 2;
+      *entries = realloc(*entries, sizeof(VideoFileEntry) * (*capacity));
+    }
+    strncpy((*entries)[*count].path, fullPath, sizeof((*entries)[0].path) - 1);
+    (*entries)[*count].path[sizeof((*entries)[0].path) - 1] = '\0';
+    strncpy((*entries)[*count].name, entry->d_name,
+            sizeof((*entries)[0].name) - 1);
+    (*entries)[*count].name[sizeof((*entries)[0].name) - 1] = '\0';
+    (*count)++;
+  }
+  closedir(dir);
+}
+
 static void batch_set_icons(const char *folder, int recursive, int width,
                             double seekPct) {
   DIR *dir = opendir(folder);
@@ -770,43 +857,87 @@ static void batch_set_icons(const char *folder, int recursive, int width,
     fprintf(stderr, "Error: Cannot open folder: %s\n", folder);
     return;
   }
-
-  struct dirent *entry;
-  int success = 0, total = 0;
-  while ((entry = readdir(dir)) != NULL) {
-    if (entry->d_name[0] == '.') continue;
-    char fullPath[4096];
-    snprintf(fullPath, sizeof(fullPath), "%s/%s", folder, entry->d_name);
-    struct stat st;
-    if (stat(fullPath, &st) != 0) continue;
-    if (S_ISDIR(st.st_mode) && recursive) {
-      batch_set_icons(fullPath, recursive, width, seekPct);
-      continue;
-    }
-    if (!S_ISREG(st.st_mode)) continue;
-    if (!is_video_extension(entry->d_name)) continue;
-    total++;
-
-    @autoreleasepool {
-      IconVideoInfo info;
-      get_icon_video_info(fullPath, &info);
-      CGImageRef frame = extract_frame(fullPath, width, seekPct);
-      if (!frame) {
-        printf("  \xe2\x9d\x8c %s\n", entry->d_name);
-        continue;
-      }
-      NSImage *richIcon = create_rich_icon(frame, &info, width);
-      CGImageRelease(frame);
-      if (richIcon) {
-        NSString *path = [NSString stringWithUTF8String:fullPath];
-        [[NSWorkspace sharedWorkspace] setIcon:richIcon forFile:path options:0];
-        printf("  \xe2\x9c\x85 %s\n", entry->d_name);
-        success++;
-      }
-    }
-  }
   closedir(dir);
-  printf("\n\xf0\x9f\x93\x8a Done: %d/%d icons (frame at %d%%)\n", success, total, (int)(seekPct * 100));
+
+  // Phase 1: Collect all video files
+  VideoFileEntry *entries = NULL;
+  int total = 0, capacity = 0;
+  collect_video_files(folder, recursive, &entries, &total, &capacity);
+
+  if (total == 0) {
+    printf("  No video files found.\n");
+    free(entries);
+    return;
+  }
+  printf("  Found %d video(s). Processing...\n\n", total);
+
+  // Phase 2: Process in parallel using GCD
+  __block int32_t success = 0;
+  struct timespec startTime;
+  clock_gettime(CLOCK_MONOTONIC, &startTime);
+
+  // Limit concurrency to avoid memory pressure
+  int maxWorkers = 4;
+  dispatch_semaphore_t sem = dispatch_semaphore_create(maxWorkers);
+  dispatch_group_t group = dispatch_group_create();
+  dispatch_queue_t queue =
+      dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+  // Serial queue for AppKit drawing (NSImage lockFocus is NOT thread-safe)
+  dispatch_queue_t drawQueue =
+      dispatch_queue_create("com.vidicon.draw", DISPATCH_QUEUE_SERIAL);
+
+  for (int i = 0; i < total; i++) {
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    dispatch_group_async(group, queue, ^{
+      @autoreleasepool {
+        const char *fullPath = entries[i].path;
+        const char *name = entries[i].name;
+        int idx = i + 1;
+
+        // Thread-safe: FFmpeg uses per-call contexts
+        IconVideoInfo info;
+        get_icon_video_info(fullPath, &info);
+        CGImageRef frame = extract_frame(fullPath, width, seekPct);
+        if (!frame) {
+          printf("  [%d/%d] \xe2\x9d\x8c %s\n", idx, total, name);
+          dispatch_semaphore_signal(sem);
+          return;
+        }
+
+        // Serialize AppKit drawing + icon setting (not thread-safe)
+        dispatch_sync(drawQueue, ^{
+          @autoreleasepool {
+            NSImage *richIcon =
+                create_rich_icon(frame, (IconVideoInfo *)&info, width);
+            CGImageRelease(frame);
+            if (richIcon) {
+              NSString *path = [NSString stringWithUTF8String:fullPath];
+              [[NSWorkspace sharedWorkspace] setIcon:richIcon
+                                             forFile:path
+                                             options:0];
+              printf("  [%d/%d] \xe2\x9c\x85 %s\n", idx, total, name);
+              __sync_fetch_and_add(&success, 1);
+            } else {
+              printf("  [%d/%d] \xe2\x9d\x8c %s (icon failed)\n", idx, total,
+                     name);
+            }
+          }
+        });
+      }
+      dispatch_semaphore_signal(sem);
+    });
+  }
+
+  dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+
+  struct timespec endTime;
+  clock_gettime(CLOCK_MONOTONIC, &endTime);
+  double elapsed = (endTime.tv_sec - startTime.tv_sec) +
+                   (endTime.tv_nsec - startTime.tv_nsec) / 1e9;
+
+  printf("\n\xf0\x9f\x93\x8a Done: %d/%d icons (frame at %d%%) in %.1fs\n",
+         success, total, (int)(seekPct * 100), elapsed);
+  free(entries);
 }
 
 // ---- Quick Look preview (remux to MOV + open qlmanage) ----
@@ -845,14 +976,29 @@ static int is_ql_native_codec(const char *codec) {
           strcasecmp(codec, "prores") == 0);
 }
 
+static void safe_qlmanage(const char *path) {
+  pid_t pid;
+  int devnull = open("/dev/null", O_WRONLY);
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  if (devnull >= 0) {
+    posix_spawn_file_actions_adddup2(&actions, devnull, STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+  }
+  char *args[] = {"qlmanage", "-p", (char *)path, NULL};
+  extern char **environ;
+  posix_spawnp(&pid, "qlmanage", &actions, NULL, args, environ);
+  posix_spawn_file_actions_destroy(&actions);
+  if (devnull >= 0)
+    close(devnull);
+}
+
 static void quicklook_preview(const char *filePath, int fullLength) {
   // Check if the file is already a MOV/MP4 that macOS can natively preview
   const char *ext = strrchr(filePath, '.');
   if (ext && (strcasecmp(ext, ".mov") == 0 || strcasecmp(ext, ".m4v") == 0)) {
     // Native format - open directly
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "qlmanage -p \"%s\" &>/dev/null &", filePath);
-    system(cmd);
+    safe_qlmanage(filePath);
     return;
   }
 
@@ -897,47 +1043,70 @@ static void quicklook_preview(const char *filePath, int fullLength) {
     if (duration > 0 && maxDur > 0 && duration < maxDur)
       maxDur = 0; // File shorter than limit
 
-    char cmd[8192];
-    if (is_ql_native_codec(videoCodec)) {
-      // Fast remux: just change container (stream copy)
-      printf("🔄 Remuxing to MOV (fast copy)...\n");
-      if (maxDur > 0) {
-        snprintf(cmd, sizeof(cmd),
-                 "%s -i \"%s\" -t %.0f -c copy -movflags +faststart -y \"%s\" "
-                 "2>/dev/null",
-                 FFMPEG_BIN, filePath, maxDur, cachePath);
-      } else {
-        snprintf(
-            cmd, sizeof(cmd),
-            "%s -i \"%s\" -c copy -movflags +faststart -y \"%s\" 2>/dev/null",
-            FFMPEG_BIN, filePath, cachePath);
-      }
-    } else {
-      // Transcode to H.264 for compatibility
-      printf("🔄 Transcoding to H.264 (this may take a moment)...\n");
-      if (maxDur > 0) {
-        snprintf(cmd, sizeof(cmd),
-                 "%s -i \"%s\" -t %.0f "
-                 "-c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k "
-                 "-vf "
-                 "\"scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_"
-                 "ratio=decrease\" "
-                 "-movflags +faststart -y \"%s\" 2>/dev/null",
-                 FFMPEG_BIN, filePath, maxDur, cachePath);
-      } else {
-        snprintf(cmd, sizeof(cmd),
-                 "%s -i \"%s\" "
-                 "-c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k "
-                 "-vf "
-                 "\"scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_"
-                 "ratio=decrease\" "
-                 "-movflags +faststart -y \"%s\" 2>/dev/null",
-                 FFMPEG_BIN, filePath, cachePath);
-      }
+    // Build ffmpeg args safely (no shell injection)
+    int nargs = 0;
+    char durStr[32];
+    char *ffargs[32];
+    ffargs[nargs++] = FFMPEG_BIN;
+    ffargs[nargs++] = "-i";
+    ffargs[nargs++] = (char *)filePath;
+    if (maxDur > 0) {
+      snprintf(durStr, sizeof(durStr), "%.0f", maxDur);
+      ffargs[nargs++] = "-t";
+      ffargs[nargs++] = durStr;
     }
 
-    int ret = system(cmd);
-    if (ret != 0) {
+    if (is_ql_native_codec(videoCodec)) {
+      printf("🔄 Remuxing to MOV (fast copy)...\n");
+      ffargs[nargs++] = "-c";
+      ffargs[nargs++] = "copy";
+    } else {
+      printf("🔄 Transcoding to H.264 (this may take a moment)...\n");
+      ffargs[nargs++] = "-c:v";
+      ffargs[nargs++] = "libx264";
+      ffargs[nargs++] = "-preset";
+      ffargs[nargs++] = "fast";
+      ffargs[nargs++] = "-crf";
+      ffargs[nargs++] = "23";
+      ffargs[nargs++] = "-c:a";
+      ffargs[nargs++] = "aac";
+      ffargs[nargs++] = "-b:a";
+      ffargs[nargs++] = "192k";
+      ffargs[nargs++] = "-vf";
+      ffargs[nargs++] =
+          "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_"
+          "ratio=decrease";
+    }
+    ffargs[nargs++] = "-movflags";
+    ffargs[nargs++] = "+faststart";
+    ffargs[nargs++] = "-y";
+    ffargs[nargs++] = cachePath;
+    ffargs[nargs] = NULL;
+
+    // Spawn ffmpeg without shell
+    pid_t pid;
+    int devnull = open("/dev/null", O_WRONLY);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    if (devnull >= 0) {
+      posix_spawn_file_actions_adddup2(&actions, devnull, STDOUT_FILENO);
+      posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+    }
+    extern char **environ;
+    int spawnRet =
+        posix_spawn(&pid, FFMPEG_BIN, &actions, NULL, ffargs, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (devnull >= 0)
+      close(devnull);
+
+    if (spawnRet != 0) {
+      fprintf(stderr, "❌ Failed to launch ffmpeg\n");
+      unlink(cachePath);
+      return;
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
       fprintf(stderr, "❌ Failed to create preview\n");
       unlink(cachePath);
       return;
@@ -947,9 +1116,7 @@ static void quicklook_preview(const char *filePath, int fullLength) {
 
   // Open in Quick Look
   printf("▶️  Opening Quick Look...\n");
-  char qlCmd[4096];
-  snprintf(qlCmd, sizeof(qlCmd), "qlmanage -p \"%s\" &>/dev/null &", cachePath);
-  system(qlCmd);
+  safe_qlmanage(cachePath);
 }
 
 // ---- Main ----
@@ -958,7 +1125,9 @@ static void print_usage(void) {
   printf("VidIcon - Rich video thumbnails for macOS Finder\n\n");
   printf("Usage:\n");
   printf("  vidicon icons <folder> [--recursive] [--width N]    Set Finder "
-         "icons\n");
+         "icons (parallel)\n");
+  printf("  vidicon icon <video> [--seek N] [--width N]         Set single "
+         "file icon\n");
   printf("  vidicon info <video>                                Show video "
          "metadata\n");
   printf("  vidicon thumbnail <video> [output.png] [width]      Extract "
@@ -1016,15 +1185,16 @@ int main(int argc, char *argv[]) {
       printf("📸 Extracting thumbnail from: %s\n", inputPath);
       CGImageRef image = extract_frame(inputPath, width, 0.10);
       if (image) {
-        if (save_as_png(image, outputPath) == 0) {
+        int saveResult = save_as_png(image, outputPath);
+        if (saveResult == 0) {
           printf("✅ Saved to: %s (%zux%zu)\n", outputPath,
                  CGImageGetWidth(image), CGImageGetHeight(image));
         } else {
           fprintf(stderr, "❌ Failed to save PNG\n");
-          CGImageRelease(image);
-          return 1;
         }
         CGImageRelease(image);
+        if (saveResult != 0)
+          return 1;
       } else {
         fprintf(stderr, "❌ Failed to extract frame\n");
         return 1;
@@ -1058,6 +1228,29 @@ int main(int argc, char *argv[]) {
           width = atoi(argv[++i]);
       }
       batch_thumbnails(argv[2], recursive, width);
+
+    } else if (strcmp(cmd, "icon") == 0) {
+      // Single file icon setting
+      if (argc < 3) {
+        fprintf(stderr, "Error: Missing video path\n");
+        return 1;
+      }
+      int width = 512;
+      double seekPct = 0.10;
+      for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--width") == 0 && i + 1 < argc)
+          width = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--seek") == 0 && i + 1 < argc)
+          seekPct = atoi(argv[++i]) / 100.0;
+      }
+      if (!is_video_extension(argv[2])) {
+        fprintf(stderr, "Skipped (not a video): %s\n", argv[2]);
+        return 0;
+      }
+      printf("🎨 Setting icon for: %s (frame at %d%%)\n", argv[2],
+             (int)(seekPct * 100));
+      set_rich_finder_icon(argv[2], width, seekPct);
+      printf("✅ Done\n");
 
     } else if (strcmp(cmd, "icons") == 0) {
       if (argc < 3) {
