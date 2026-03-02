@@ -771,34 +771,24 @@ static void batch_set_icons(const char *folder, int recursive, int width,
     return;
   }
 
-  // Collect all video file paths first
-  char **files = NULL;
+  // Collect all video file paths
   int fileCount = 0;
-  int fileCapacity = 64;
-  files = (char **)malloc(fileCapacity * sizeof(char *));
+  int fileCapacity = 256;
+  char **files = (char **)malloc(fileCapacity * sizeof(char *));
 
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
-    if (entry->d_name[0] == '.')
-      continue;
-
+    if (entry->d_name[0] == '.') continue;
     char fullPath[4096];
     snprintf(fullPath, sizeof(fullPath), "%s/%s", folder, entry->d_name);
-
     struct stat st;
-    if (stat(fullPath, &st) != 0)
-      continue;
-
+    if (stat(fullPath, &st) != 0) continue;
     if (S_ISDIR(st.st_mode) && recursive) {
       batch_set_icons(fullPath, recursive, width, seekPct);
       continue;
     }
-
-    if (!S_ISREG(st.st_mode))
-      continue;
-    if (!is_video_extension(entry->d_name))
-      continue;
-
+    if (!S_ISREG(st.st_mode)) continue;
+    if (!is_video_extension(entry->d_name)) continue;
     if (fileCount >= fileCapacity) {
       fileCapacity *= 2;
       files = (char **)realloc(files, fileCapacity * sizeof(char *));
@@ -807,40 +797,55 @@ static void batch_set_icons(const char *folder, int recursive, int width,
   }
   closedir(dir);
 
-  if (fileCount == 0) {
-    free(files);
-    return;
-  }
+  if (fileCount == 0) { free(files); return; }
 
-  printf("\xf0\x9f\x9a\x80 Processing %d videos in parallel...\n", fileCount);
+  printf("\xf0\x9f\x9a\x80 Processing %d videos...\n", fileCount);
   fflush(stdout);
 
-  __block int32_t done = 0;
-  int total = fileCount;
+  // Phase 1: Extract frames + metadata in parallel
+  __block CGImageRef *frames = (CGImageRef *)calloc(fileCount, sizeof(CGImageRef));
+  __block IconVideoInfo *infos = (IconVideoInfo *)calloc(fileCount, sizeof(IconVideoInfo));
 
-  // Use dispatch_apply for parallel iteration with automatic thread management
-  dispatch_queue_t queue = dispatch_queue_create("com.vidicon.batch", DISPATCH_QUEUE_CONCURRENT);
-  dispatch_semaphore_t sem = dispatch_semaphore_create(4); // max 4 concurrent
-
-  dispatch_apply(fileCount, queue, ^(size_t idx) {
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+  dispatch_apply(fileCount, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t idx) {
     @autoreleasepool {
-      set_rich_finder_icon(files[idx], width, seekPct);
-      int32_t d = OSAtomicIncrement32(&done);
-      const char *name = strrchr(files[idx], '/');
-      name = name ? name + 1 : files[idx];
-      printf("  \xe2\x9c\x85 [%d/%d] %s\n", d, total, name);
-      fflush(stdout);
+      get_icon_video_info(files[idx], &infos[idx]);
+      frames[idx] = extract_frame(files[idx], width, seekPct);
     }
-    dispatch_semaphore_signal(sem);
   });
 
-  // Cleanup
-  for (int i = 0; i < fileCount; i++)
-    free(files[i]);
-  free(files);
+  // Phase 2: Create rich icons and set them (sequential - NSWorkspace is not thread-safe)
+  int success = 0;
+  for (int i = 0; i < fileCount; i++) {
+    const char *name = strrchr(files[i], '/');
+    name = name ? name + 1 : files[i];
 
-  printf("\n\xf0\x9f\x93\x8a Done: %d icons (frame at %d%%)\n", total, (int)(seekPct * 100));
+    if (!frames[i]) {
+      printf("  \xe2\x9d\x8c %s (no frame)\n", name);
+      continue;
+    }
+
+    NSImage *richIcon = create_rich_icon(frames[i], &infos[i], width);
+    CGImageRelease(frames[i]);
+
+    if (richIcon) {
+      @autoreleasepool {
+        NSString *path = [NSString stringWithUTF8String:files[i]];
+        [[NSWorkspace sharedWorkspace] setIcon:richIcon forFile:path options:0];
+      }
+      printf("  \xe2\x9c\x85 %s\n", name);
+      success++;
+    } else {
+      printf("  \xe2\x9d\x8c %s (icon failed)\n", name);
+    }
+  }
+
+  // Cleanup
+  for (int i = 0; i < fileCount; i++) free(files[i]);
+  free(files);
+  free(frames);
+  free(infos);
+
+  printf("\n\xf0\x9f\x93\x8a Done: %d/%d icons (frame at %d%%)\n", success, fileCount, (int)(seekPct * 100));
 }
 
 // ---- Quick Look preview (remux to MOV + open qlmanage) ----
